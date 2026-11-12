@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}FASTQ 样本入湖{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="{{ url_for('index') }}">
+        <span class="brand-mark">PE</span>
+        <span>
+          <strong>FASTQ 样本入湖</strong>
+          <small>双端配对 · 原子发布</small>
+        </span>
+      </a>
+      <span class="header-note">R1 原顺序 · 内存有界 · SQLite 配对索引</span>
+    </div>
+  </header>
+  <main class="wrap">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="wrap footer">
+    仅接受每条四行的 gzip FASTQ。缺配、重复 ID、长度不等或 gzip 损坏均不会发布任何部分结果。
+  </footer>
+  <script src="{{ url_for('static', filename='ingest-ui.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

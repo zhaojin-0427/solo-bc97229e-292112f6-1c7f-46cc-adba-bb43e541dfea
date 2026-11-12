@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}样本 {{ job.sample_id }} · 处理进度{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <p class="eyebrow">Sample Intake Job</p>
+    <h1>样本 {{ job.sample_id }}</h1>
+    <p class="muted">任务 <code>{{ job.id }}</code></p>
+  </div>
+  <a class="button ghost" href="{{ url_for('index') }}">返回上传页</a>
+</div>
+
+<div class="layout single">
+  <section class="card">
+    <div class="job-head">
+      <div>
+        <p class="eyebrow" id="job-sample-label">处理进度</p>
+        <h2 id="job-status-label">{{ job.status_label }}</h2>
+      </div>
+      <span id="job-percent" class="percent">{{ job.progress }}%</span>
+    </div>
+    <div class="progress-track" aria-hidden="true">
+      <div id="job-progress-bar" class="progress-bar" style="width:{{ job.progress }}%"></div>
+    </div>
+    <p id="job-stage" class="stage">{{ job.stage }}</p>
+    <div class="counts">
+      <span>R1 已读 <b id="job-r1-reads">{{ job.r1_reads }}</b></span>
+      <span>R2 已读 <b id="job-r2-reads">{{ job.r2_reads }}</b></span>
+    </div>
+
+    <div id="job-error" class="alert alert-error" {% if not job.error %}hidden{% endif %}>{{ job.error or "" }}</div>
+
+    <div id="current-package" class="published-box" {% if not job.current_package %}hidden{% endif %}>
+      <p id="current-package-title"><b>当前可下载版本</b></p>
+      <p id="current-package-meta" class="muted">
+        {% if job.current_package %}
+        {{ job.current_package.read_count }} 对 · release {{ job.current_package.release_id }} · {{ job.current_package.created_at }}
+        {% endif %}
+      </p>
+      <div class="button-row">
+        <a id="download-package-link" class="button"
+           href="{{ job.current_package.download_url if job.current_package else '#' }}">下载样本 ZIP</a>
+        <a id="download-r1-link" class="button ghost"
+           href="{{ job.current_package.r1_url if job.current_package else '#' }}">R1.fastq.gz</a>
+        <a id="download-r2-link" class="button ghost"
+           href="{{ job.current_package.r2_url if job.current_package else '#' }}">R2.fastq.gz</a>
+      </div>
+    </div>
+
+    <div id="job-complete" class="success-box" {% if job.status != 'succeeded' %}hidden{% endif %}>
+      <b>处理完成。</b>新的 R1/R2 已校验并一起发布。
+      <a href="{{ url_for('index') }}">刷新发布的样本包列表</a>
+    </div>
+
+    <div class="process-notes">
+      <h3>处理保证</h3>
+      <ul>
+        <li>按 R1 原始顺序输出，R2 逐条同步排列。</li>
+        <li>缺配、重复 ID、序列/质量长度不等、gzip 末尾损坏都会使任务失败。</li>
+        <li>只有两个新文件和 ZIP 全部写完并复读校验成功后，才原子替换 <code>current</code>。</li>
+        <li>任务失败或进程中断时，旧版本保持完整且仍可下载。</li>
+      </ul>
+    </div>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    const job = {{ job|tojson }};
+    window.IngestUI.renderJob(job);
+    if (job.status === "queued" || job.status === "running") {
+      window.IngestUI.pollJob(
+        "{{ url_for('job_api', job_id=job.id) }}",
+        { onJob: window.IngestUI.renderJob }
+      );
+    }
+  })();
+</script>
+{% endblock %}

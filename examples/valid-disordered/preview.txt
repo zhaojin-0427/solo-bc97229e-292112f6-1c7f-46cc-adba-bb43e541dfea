@@ -1,0 +1,4 @@
+R1 input order: DEMO-03, DEMO-01, DEMO-04, DEMO-02
+R2 input order: DEMO-02, DEMO-04, DEMO-01, DEMO-03
+Expected synchronized output order: DEMO-03, DEMO-01, DEMO-04, DEMO-02
+All records have four lines; headers use /1 and /2.

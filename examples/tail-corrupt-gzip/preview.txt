@@ -1,0 +1,3 @@
+R1 and R2 IDs match, but R2's gzip CRC trailer is intentionally corrupt.
+Expected: all R2 records are readable, then a CRC error is found at EOF.
+No package is published.

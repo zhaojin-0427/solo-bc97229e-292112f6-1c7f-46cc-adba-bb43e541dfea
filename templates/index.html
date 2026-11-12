@@ -1,0 +1,211 @@
+{% extends "base.html" %}
+{% block title %}FASTQ 样本入湖{% endblock %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Sequencing Center · Data Lake Intake</p>
+    <h1>把乱序双端 FASTQ<br><em>整理成可成对读取的样本包</em></h1>
+    <p class="lede">
+      上传样本号与 R1、R2 两个 gzip 文件。系统按 R1 的原始顺序重排两端记录，
+      在全部校验通过后一次性发布两个同步的 gzip 文件。
+    </p>
+  </div>
+  <div class="hero-facts">
+    <div><b>4 行</b><span>每条 FASTQ 记录</span></div>
+    <div><b>1:1</b><span>两端 ID 集合必须一致</span></div>
+    <div><b>原子</b><span>成功后才替换旧包</span></div>
+  </div>
+</section>
+
+{% if error %}
+<div class="alert alert-error" role="alert">{{ error }}</div>
+{% endif %}
+
+<div class="layout">
+  <section class="card upload-card">
+    <h2>上传样本</h2>
+    <p class="muted">
+      标题首个空白前的内容作为 ID，末尾的 <code>/1</code> 或 <code>/2</code>
+      会被去掉后用于配对。序列与质量行长度必须相等。
+    </p>
+    <form id="upload-form" action="{{ url_for('upload_sample') }}" method="post" enctype="multipart/form-data">
+      <label class="field">
+        <span>样本号</span>
+        <input id="sample-id" name="sample_id" type="text" required maxlength="128"
+               pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+               placeholder="例如：RUN20261112_S01" autocomplete="off">
+        <small>字母或数字开头，仅允许字母、数字、点、下划线、连字符。</small>
+      </label>
+
+      <div class="file-grid">
+        <label class="file-picker" data-file-picker>
+          <span class="file-tag">R1</span>
+          <strong>选择 R1 gzip</strong>
+          <small class="file-name" data-file-name>未选择文件</small>
+          <input id="r1-file" name="r1" type="file" required accept=".gz,application/gzip">
+        </label>
+        <label class="file-picker" data-file-picker>
+          <span class="file-tag tag-r2">R2</span>
+          <strong>选择 R2 gzip</strong>
+          <small class="file-name" data-file-name>未选择文件</small>
+          <input id="r2-file" name="r2" type="file" required accept=".gz,application/gzip">
+        </label>
+      </div>
+
+      {% if max_upload and max_upload > 0 %}
+      <p class="muted tiny">单次请求上限：{{ max_upload }} 字节，可通过 <code>MAX_UPLOAD_BYTES</code> 调整。</p>
+      {% endif %}
+
+      <button id="submit-button" class="primary" type="submit">开始上传并处理</button>
+    </form>
+
+    <div id="job-panel" class="job-panel" hidden>
+      <div class="job-head">
+        <div>
+          <p class="eyebrow" id="job-sample-label">处理进度</p>
+          <h3 id="job-status-label">上传中</h3>
+        </div>
+        <span id="job-percent" class="percent">0%</span>
+      </div>
+      <div class="progress-track" aria-hidden="true">
+        <div id="job-progress-bar" class="progress-bar" style="width:0%"></div>
+      </div>
+      <p id="job-stage" class="stage">正在上传文件…</p>
+      <div class="counts">
+        <span>R1 已读 <b id="job-r1-reads">0</b></span>
+        <span>R2 已读 <b id="job-r2-reads">0</b></span>
+      </div>
+      <div id="job-error" class="alert alert-error" hidden></div>
+      <div id="current-package" class="published-box" hidden>
+        <p id="current-package-title"><b>当前可下载版本</b></p>
+        <p id="current-package-meta" class="muted"></p>
+        <div class="button-row">
+          <a id="download-package-link" class="button" href="#">下载样本 ZIP</a>
+          <a id="download-r1-link" class="button ghost" href="#">R1.fastq.gz</a>
+          <a id="download-r2-link" class="button ghost" href="#">R2.fastq.gz</a>
+        </div>
+      </div>
+      <div id="job-complete" class="success-box" hidden>
+        <b>处理完成。</b>新的 R1/R2 已校验并一起发布。
+        <a href="{{ url_for('index') }}">刷新列表</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="card packages-card">
+    <div class="section-head">
+      <div>
+        <h2>已发布样本包</h2>
+        <p class="muted">每个包内的 R1 与 R2 顺序严格同步，顺序以 R1 为准。</p>
+      </div>
+      <span class="count-pill">{{ packages|length }} 个</span>
+    </div>
+    {% if packages %}
+    <div class="package-list">
+      {% for package in packages %}
+      <article class="package-item">
+        <div class="package-main">
+          <h3>{{ package.sample_id }}</h3>
+          <p class="muted">
+            {{ package.read_count }} 对 · 发布 {{ package.created_at }}<br>
+            R1 {{ package.r1_size }} B / R2 {{ package.r2_size }} B
+          </p>
+        </div>
+        <div class="package-actions">
+          <a class="button" href="{{ package.download_url }}">下载 ZIP</a>
+          <details>
+            <summary>单文件与清单</summary>
+            <div class="detail-links">
+              <a href="{{ package.r1_url }}">R1.fastq.gz</a>
+              <a href="{{ package.r2_url }}">R2.fastq.gz</a>
+              <a href="{{ package.manifest_url }}">manifest.json</a>
+            </div>
+          </details>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+      <p>还没有已发布的样本包。</p>
+      <small>上传乱序示例后，这里会出现可下载的 ZIP。</small>
+    </div>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    const form = document.getElementById("upload-form");
+    const submitButton = document.getElementById("submit-button");
+    const panel = document.getElementById("job-panel");
+    if (!form || !window.IngestUI) return;
+
+    document.querySelectorAll("[data-file-picker]").forEach(function (picker) {
+      const input = picker.querySelector('input[type="file"]');
+      const label = picker.querySelector("[data-file-name]");
+      input.addEventListener("change", function () {
+        label.textContent = input.files && input.files[0]
+          ? input.files[0].name
+          : "未选择文件";
+        picker.classList.toggle("has-file", Boolean(input.files && input.files[0]));
+      });
+    });
+
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      const r1 = document.getElementById("r1-file").files[0];
+      const r2 = document.getElementById("r2-file").files[0];
+      if (!r1 || !r2) {
+        window.IngestUI.showError("请同时选择 R1 和 R2 两个 gzip 文件。");
+        return;
+      }
+      panel.hidden = false;
+      submitButton.disabled = true;
+      document.getElementById("job-error").hidden = true;
+      document.getElementById("job-complete").hidden = true;
+      window.IngestUI.renderUploading();
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", form.action, true);
+      xhr.setRequestHeader("Accept", "application/json");
+      xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+
+      xhr.upload.addEventListener("progress", function (event) {
+        if (!event.lengthComputable) return;
+        const percent = Math.min(99, Math.round(event.loaded / event.total * 100));
+        window.IngestUI.renderUploadProgress(percent);
+      });
+
+      xhr.addEventListener("load", function () {
+        let data = {};
+        try { data = JSON.parse(xhr.responseText || "{}"); } catch (_) {}
+        if (xhr.status === 202 && data.status_url) {
+          window.IngestUI.setUploadDone();
+          window.IngestUI.pollJob(data.status_url, {
+            onJob: window.IngestUI.renderJob,
+            onTerminal: function (job) {
+              submitButton.disabled = false;
+              if (job.status === "succeeded") {
+                document.getElementById("job-complete").hidden = false;
+              }
+            }
+          });
+        } else {
+          submitButton.disabled = false;
+          window.IngestUI.showError(data.error || ("上传失败（HTTP " + xhr.status + "）"));
+        }
+      });
+
+      xhr.addEventListener("error", function () {
+        submitButton.disabled = false;
+        window.IngestUI.showError("网络错误，上传未完成。");
+      });
+
+      xhr.send(new FormData(form));
+    });
+  })();
+</script>
+{% endblock %}

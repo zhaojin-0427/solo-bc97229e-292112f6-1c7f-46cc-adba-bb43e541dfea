@@ -1,0 +1,4 @@
+R1 IDs: TAIL-01, TAIL-02, TAIL-03
+R2 IDs: TAIL-01, TAIL-02
+Expected: failure at end of R2; R1 has TAIL-03 without an R2 mate.
+No package is published.
