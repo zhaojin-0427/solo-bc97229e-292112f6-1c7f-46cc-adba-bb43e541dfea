@@ -6,6 +6,7 @@ worker.  Pairing and publication are implemented in ingest.py/publish.py.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import re
@@ -28,10 +29,11 @@ from flask import (
     url_for,
 )
 
+import ownership
 from ingest import IngestError, run_ingest
 from publish import (
     PublishError,
-    cleanup_incomplete,
+    _current_target,
     create_release,
     iter_snapshots,
     snapshot_for_sample,
@@ -48,6 +50,7 @@ STATUS_LABELS = {
     "running": "处理中",
     "succeeded": "已完成",
     "failed": "失败",
+    "interrupted": "已中断",
 }
 
 
@@ -116,41 +119,7 @@ def connect_main_db(path: Path) -> sqlite3.Connection:
 def _init_main_db(path: Path) -> None:
     conn = connect_main_db(path)
     try:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-                id TEXT PRIMARY KEY,
-                sample_id TEXT NOT NULL,
-                status TEXT NOT NULL,
-                stage TEXT NOT NULL,
-                progress INTEGER NOT NULL DEFAULT 0,
-                r1_reads INTEGER NOT NULL DEFAULT 0,
-                r2_reads INTEGER NOT NULL DEFAULT 0,
-                error TEXT,
-                release_id TEXT,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                finished_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS packages (
-                sample_id TEXT PRIMARY KEY,
-                release_id TEXT NOT NULL,
-                read_count INTEGER NOT NULL,
-                r1_sha256 TEXT,
-                r2_sha256 TEXT,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_active_per_sample
-                ON jobs(sample_id)
-                WHERE status IN ('queued', 'running');
-
-            CREATE INDEX IF NOT EXISTS jobs_sample_created
-                ON jobs(sample_id, created_at);
-            """
-        )
-        conn.commit()
+        ownership.init_schema(conn)
     finally:
         conn.close()
 
@@ -161,131 +130,57 @@ def _utc_now() -> str:
     return utc_now_iso()
 
 
-def _mark_job_failed(
-    conn: sqlite3.Connection, job_id: str, error: str, stage: str = "失败"
-) -> None:
-    finished = _utc_now()
-    conn.execute(
-        """
-        UPDATE jobs
-           SET status = 'failed', stage = ?, progress = 100, error = ?,
-               finished_at = COALESCE(finished_at, ?)
-         WHERE id = ? AND status IN ('queued', 'running')
-        """,
-        (stage, _tail(error), finished, job_id),
-    )
+def _rebuild_package_catalog(conn: sqlite3.Connection, packages_root: Path) -> list:
+    """Re-sync the packages table from the packages on disk.
+
+    Published packages live entirely on disk under ``current`` symlinks, so the
+    catalog is always rebuildable and an in-flight result is never republished.
+    """
+
+    snapshots = list(iter_snapshots(packages_root))
+    seen = set()
+    for snapshot in snapshots:
+        seen.add(snapshot.sample_id)
+        ownership.upsert_package(conn, snapshot)
+    if seen:
+        placeholders = ",".join("?" for _ in seen)
+        conn.execute(
+            f"DELETE FROM packages WHERE sample_id NOT IN ({placeholders})",
+            tuple(seen),
+        )
+    else:
+        conn.execute("DELETE FROM packages")
     conn.commit()
-
-
-def _upsert_package(conn: sqlite3.Connection, snapshot) -> None:
-    manifest = snapshot.manifest
-    files = manifest.get("files") or {}
-    r1 = files.get("R1") or {}
-    r2 = files.get("R2") or {}
-    conn.execute(
-        """
-        INSERT INTO packages(sample_id, release_id, read_count, r1_sha256,
-                             r2_sha256, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(sample_id) DO UPDATE SET
-            release_id = excluded.release_id,
-            read_count = excluded.read_count,
-            r1_sha256 = excluded.r1_sha256,
-            r2_sha256 = excluded.r2_sha256,
-            updated_at = excluded.updated_at
-        """,
-        (
-            snapshot.sample_id,
-            snapshot.release_id,
-            _readable_int(manifest.get("read_count")),
-            r1.get("sha256"),
-            r2.get("sha256"),
-            manifest.get("created_at") or _utc_now(),
-        ),
-    )
+    return snapshots
 
 
 def _reconcile_startup(app: Flask) -> None:
-    """Recover metadata from disk and close interrupted jobs.
+    """Rebuild the package catalog and reclaim jobs of dead owner processes.
 
-    Published packages live entirely on disk under ``current`` symlinks, so a
-    restart only needs to rebuild the database's catalog and never republishes
-    an in-flight result.
+    Jobs whose owner still holds a fresh heartbeat (for example when a second
+    process is started against the same data directory during an upgrade) are
+    never touched: their staging files stay on disk, their status stays
+    queued/running and the sample keeps rejecting duplicate uploads.
     """
 
     packages_root: Path = app.config["PACKAGES_DIR"]
     staging_root: Path = app.config["STAGING_DIR"]
     conn = connect_main_db(app.config["DB_PATH"])
     try:
-        snapshots = list(iter_snapshots(packages_root))
-        seen = set()
-        for snapshot in snapshots:
-            seen.add(snapshot.sample_id)
-            _upsert_package(conn, snapshot)
-        if seen:
-            placeholders = ",".join("?" for _ in seen)
-            conn.execute(
-                f"DELETE FROM packages WHERE sample_id NOT IN ({placeholders})",
-                tuple(seen),
-            )
-        else:
-            conn.execute("DELETE FROM packages")
-        conn.commit()
-
-        active = conn.execute(
-            """
-            SELECT id, sample_id, status FROM jobs
-             WHERE status IN ('queued', 'running')
-            """
-        ).fetchall()
-        snapshots_by_sample = {snap.sample_id: snap for snap in snapshots}
-        for job in active:
-            snapshot = snapshots_by_sample.get(job["sample_id"])
-            manifest = snapshot.manifest if snapshot else {}
-            if snapshot is not None and manifest.get("job_id") == job["id"]:
-                # The verified release had been swapped in just before the
-                # process died.  It is complete and must be treated as success.
-                conn.execute(
-                    """
-                    UPDATE jobs
-                       SET status = 'succeeded', stage = '完成', progress = 100,
-                           error = NULL, release_id = ?, started_at = COALESCE(
-                               started_at, ?), finished_at = ?
-                     WHERE id = ?
-                    """,
-                    (
-                        snapshot.release_id,
-                        manifest.get("created_at") or _utc_now(),
-                        manifest.get("created_at") or _utc_now(),
-                        job["id"],
-                    ),
-                )
-                _upsert_package(conn, snapshot)
-            else:
-                _mark_job_failed(
-                    conn,
-                    job["id"],
-                    "服务重启导致处理中断；已发布的旧样本包未受影响。",
-                )
-        conn.commit()
+        _rebuild_package_catalog(conn, packages_root)
+        ownership.reap_jobs(
+            conn,
+            packages_root=packages_root,
+            staging_root=staging_root,
+            stale_seconds=float(app.config["PROCESS_STALE_SECONDS"]),
+            orphan_age_seconds=float(app.config["STAGING_ORPHAN_SECONDS"]),
+            logger=app.logger,
+        )
     finally:
         conn.close()
 
-    # Uploads and work directories from interrupted jobs are not resumable.
-    if staging_root.is_dir():
-        for item in staging_root.iterdir():
-            try:
-                if item.is_dir():
-                    shutil.rmtree(item)
-                else:
-                    item.unlink()
-            except OSError:
-                app.logger.warning("无法清理暂存目录：%s", item, exc_info=True)
 
-    cleanup_incomplete(packages_root)
-
-
-def _progress_writer(conn: sqlite3.Connection, job_id: str):
+def _progress_writer(conn: sqlite3.Connection, job_id: str, owner_id: str):
     last = {"time": 0.0, "stage": None, "percent": None}
 
     def update(stage: str, percent: int, r1_reads: int, r2_reads: int) -> None:
@@ -297,15 +192,11 @@ def _progress_writer(conn: sqlite3.Connection, job_id: str):
         ):
             last.update(time=now, stage=stage, percent=percent)
             try:
-                conn.execute(
-                    """
-                    UPDATE jobs
-                       SET stage = ?, progress = ?, r1_reads = ?, r2_reads = ?
-                     WHERE id = ?
-                    """,
-                    (stage, max(0, min(100, int(percent))), r1_reads, r2_reads, job_id),
-                )
-                conn.commit()
+                if not ownership.write_progress(
+                    conn, job_id, owner_id, stage, percent, r1_reads, r2_reads
+                ):
+                    # Another process reclaimed this job after the owner died.
+                    raise ownership.JobOwnershipLost(job_id)
             except sqlite3.Error:
                 # A transient status write must not abort a valid ingest.
                 try:
@@ -321,39 +212,28 @@ def app_logger():
     return logging.getLogger("sample_ingest")
 
 
-def _set_job_stage(conn: sqlite3.Connection, job_id: str, stage: str, progress: int) -> None:
-    conn.execute(
-        "UPDATE jobs SET stage = ?, progress = ? WHERE id = ?",
-        (stage, progress, job_id),
-    )
-    conn.commit()
-
-
 def _run_job(config: dict, job_id: str) -> None:
     db_path = Path(config["DB_PATH"])
     staging_root = Path(config["STAGING_DIR"])
     packages_root = Path(config["PACKAGES_DIR"])
     keep_releases = int(config["KEEP_RELEASES"])
+    owner_id = config["PROCESS_ID"]
     conn = connect_main_db(db_path)
     work_dir = staging_root / job_id
     logger = app_logger()
     try:
         job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        if job is None or job["status"] != "queued":
+        if job is None:
+            return
+        if job["status"] != "queued" or job["owner_id"] != owner_id:
+            # Another process owns the job, or it was already reclaimed.
             return
         started = _utc_now()
-        conn.execute(
-            """
-            UPDATE jobs
-               SET status = 'running', stage = '开始处理', progress = 1,
-                   started_at = ?, error = NULL
-             WHERE id = ? AND status = 'queued'
-            """,
-            (started, job_id),
-        )
-        conn.commit()
+        if not ownership.claim_running(conn, job_id, owner_id, started):
+            logger.info("任务 %s 已不归本进程所有，跳过执行", job_id)
+            return
 
-        update_progress = _progress_writer(conn, job_id)
+        update_progress = _progress_writer(conn, job_id, owner_id)
         logger.info("任务 %s 开始：样本 %s", job_id, job["sample_id"])
         input_dir = work_dir / "input"
         output_dir = work_dir / "output"
@@ -363,7 +243,19 @@ def _run_job(config: dict, job_id: str) -> None:
             output_dir,
             progress=update_progress,
         )
-        _set_job_stage(conn, job_id, "生成并原子发布样本包", 99)
+
+        # Publication fencing: remember the package currently visible for the
+        # sample before swapping.  If a newer task published in the meantime
+        # (possible after this process was reclaimed and the sample retried),
+        # create_release refuses to overwrite it.
+        sample_dir = packages_root / job["sample_id"]
+        expected_current = _current_target(sample_dir)
+        if not ownership.write_progress(
+            conn, job_id, owner_id, "生成并原子发布样本包", 99,
+            result["read_count"], result["read_count"],
+        ):
+            raise ownership.JobOwnershipLost(job_id)
+
         snapshot = create_release(
             work_dir=output_dir,
             packages_root=packages_root,
@@ -373,6 +265,7 @@ def _run_job(config: dict, job_id: str) -> None:
             r1_sha256=result["r1_sha256"],
             r2_sha256=result["r2_sha256"],
             keep_releases=keep_releases,
+            expected_current=expected_current,
         )
         if snapshot is None:
             raise PublishError("发布完成但无法读取新样本包清单")
@@ -380,32 +273,23 @@ def _run_job(config: dict, job_id: str) -> None:
         finished = _utc_now()
         for attempt in range(6):
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                _upsert_package(conn, snapshot)
-                conn.execute(
-                    """
-                    UPDATE jobs
-                       SET status = 'succeeded', stage = '完成', progress = 100,
-                           r1_reads = ?, r2_reads = ?, error = NULL,
-                           release_id = ?, finished_at = ?
-                     WHERE id = ?
-                    """,
-                    (
-                        result["read_count"],
-                        result["read_count"],
-                        snapshot.release_id,
-                        finished,
-                        job_id,
-                    ),
+                if ownership.complete_job(
+                    conn, job_id, owner_id, snapshot,
+                    result["read_count"], finished,
+                ):
+                    break
+                # The job was reclaimed while this worker was busy.  The swap
+                # itself was fenced, so the on-disk package cannot have
+                # regressed; the reaper reconciles the row from disk.
+                logger.warning(
+                    "任务 %s 发布完成但已被其他进程回收，跳过终态写入", job_id
                 )
-                conn.commit()
-                break
+                return
             except sqlite3.OperationalError:
-                conn.rollback()
                 if attempt == 5:
                     logger.error("任务 %s 发布成功但写数据库失败", job_id, exc_info=True)
-                    # The package is already live.  Startup reconciliation will
-                    # recover the status if this persists.
+                    # The package is already live.  Recovery will reconcile
+                    # the status once this process stops heartbeating.
                     return
                 time.sleep(0.2)
         logger.info(
@@ -415,28 +299,53 @@ def _run_job(config: dict, job_id: str) -> None:
             result["read_count"],
             snapshot.release_id,
         )
+    except ownership.JobOwnershipLost:
+        logger.warning(
+            "任务 %s 的归属已转移到其他进程，本进程停止后续写入", job_id
+        )
     except (IngestError, PublishError) as exc:
         logger.warning("任务 %s 失败：%s", job_id, exc)
         try:
-            _mark_job_failed(conn, job_id, str(exc))
+            if not ownership.fail_job(conn, job_id, owner_id, _tail(str(exc))):
+                logger.warning(
+                    "任务 %s 已被回收，失败状态由恢复流程处理", job_id
+                )
         except sqlite3.Error:
             logger.error("记录任务失败状态时数据库出错", exc_info=True)
     except Exception as exc:  # pragma: no cover - defensive path
         logger.error("任务 %s 发生未预期错误", job_id, exc_info=True)
         try:
-            _mark_job_failed(
+            if not ownership.fail_job(
                 conn,
                 job_id,
-                f"处理失败（{type(exc).__name__}）：{exc}",
-            )
+                owner_id,
+                _tail(f"处理失败（{type(exc).__name__}）：{exc}"),
+            ):
+                logger.warning(
+                    "任务 %s 已被回收，失败状态由恢复流程处理", job_id
+                )
         except sqlite3.Error:
             logger.error("记录任务失败状态时数据库出错", exc_info=True)
     finally:
         try:
             conn.close()
         finally:
+            # Only the owner may remove its own work directory.  A reclaimed job
+            # keeps its staging until the reaper removes it (or never, if the
+            # reclaiming process is still using this directory's sibling data).
             try:
-                shutil.rmtree(work_dir)
+                owner_now = None
+                check = connect_main_db(db_path)
+                try:
+                    row = check.execute(
+                        "SELECT owner_id FROM jobs WHERE id = ?", (job_id,)
+                    ).fetchone()
+                    if row is not None:
+                        owner_now = row["owner_id"]
+                finally:
+                    check.close()
+                if owner_now == owner_id or owner_now is None:
+                    shutil.rmtree(work_dir)
             except FileNotFoundError:
                 pass
             except OSError:
@@ -538,6 +447,19 @@ def create_app(test_config: dict | None = None) -> Flask:
         MAX_CONTENT_LENGTH=max_upload if max_upload > 0 else None,
         JOB_WORKERS=max(1, _env_int("JOB_WORKERS", 1)),
         KEEP_RELEASES=max(2, _env_int("KEEP_RELEASES", 2)),
+        PROCESS_STALE_SECONDS=max(
+            5, _env_int("PROCESS_STALE_SECONDS", 30)
+        ),
+        HEARTBEAT_INTERVAL=max(
+            0.5, float(os.environ.get("HEARTBEAT_INTERVAL") or 2.0)
+        ),
+        REAP_INTERVAL=max(
+            1.0, float(os.environ.get("REAP_INTERVAL") or 10.0)
+        ),
+        STAGING_ORPHAN_SECONDS=max(
+            60, _env_int("STAGING_ORPHAN_SECONDS", 3600)
+        ),
+        PROCESS_ID=uuid.uuid4().hex,
     )
     if test_config:
         app.config.update(test_config)
@@ -569,6 +491,24 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     _init_main_db(Path(app.config["DB_PATH"]))
     _reconcile_startup(app)
+
+    # Register this process and keep its heartbeat fresh; the background
+    # reaper only reclaims jobs whose owner stopped heartbeating.
+    supervisor = ownership.ProcessSupervisor(
+        Path(app.config["DB_PATH"]),
+        packages_root=Path(app.config["PACKAGES_DIR"]),
+        staging_root=Path(app.config["STAGING_DIR"]),
+        stale_seconds=float(app.config["PROCESS_STALE_SECONDS"]),
+        heartbeat_interval=float(app.config["HEARTBEAT_INTERVAL"]),
+        reap_interval=float(app.config["REAP_INTERVAL"]),
+        orphan_age_seconds=float(app.config["STAGING_ORPHAN_SECONDS"]),
+        process_id=app.config["PROCESS_ID"],
+        connect=lambda path: connect_main_db(Path(path)),
+        logger=app.logger,
+    )
+    supervisor.start()
+    app.extensions["process_supervisor"] = supervisor
+    atexit.register(supervisor.shutdown)
 
     executor = ThreadPoolExecutor(
         max_workers=int(app.config["JOB_WORKERS"]),
@@ -649,10 +589,10 @@ def create_app(test_config: dict | None = None) -> Flask:
             conn.execute(
                 """
                 INSERT INTO jobs(id, sample_id, status, stage, progress,
-                                 created_at)
-                VALUES (?, ?, 'queued', '排队中', 0, ?)
+                                 created_at, owner_id)
+                VALUES (?, ?, 'queued', '排队中', 0, ?, ?)
                 """,
-                (job_id, sample_id, _utc_now()),
+                (job_id, sample_id, _utc_now(), app.config["PROCESS_ID"]),
             )
             conn.commit()
         except sqlite3.IntegrityError:
@@ -680,7 +620,10 @@ def create_app(test_config: dict | None = None) -> Flask:
         except Exception as exc:
             app.logger.error("启动后台任务失败", exc_info=True)
             try:
-                _mark_job_failed(conn, job_id, f"无法启动后台任务：{exc}")
+                ownership.fail_job(
+                    conn, job_id, app.config["PROCESS_ID"],
+                    _tail(f"无法启动后台任务：{exc}"),
+                )
             except sqlite3.Error:
                 pass
             try:

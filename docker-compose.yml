@@ -11,6 +11,10 @@ services:
       JOB_WORKERS: "${JOB_WORKERS:-1}"
       KEEP_RELEASES: "${KEEP_RELEASES:-2}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      PROCESS_STALE_SECONDS: "${PROCESS_STALE_SECONDS:-30}"
+      HEARTBEAT_INTERVAL: "${HEARTBEAT_INTERVAL:-2}"
+      REAP_INTERVAL: "${REAP_INTERVAL:-10}"
+      STAGING_ORPHAN_SECONDS: "${STAGING_ORPHAN_SECONDS:-3600}"
     volumes:
       - sample-ingest-data:/data
     restart: unless-stopped

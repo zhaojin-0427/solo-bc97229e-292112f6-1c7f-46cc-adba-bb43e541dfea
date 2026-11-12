@@ -68,6 +68,11 @@
     }
   }
 
+  function isTerminal(status) {
+    return status === "succeeded" || status === "failed" ||
+      status === "interrupted";
+  }
+
   function renderCurrentPackage(job) {
     const box = el("current-package");
     if (!box) return;
@@ -82,6 +87,8 @@
       title = "旧版本仍可下载（新版本尚未发布）";
     } else if (job.status === "failed") {
       title = "本次失败未改动旧包，旧版本仍可下载";
+    } else if (job.status === "interrupted") {
+      title = "任务中断未改动旧包，旧版本仍可下载，可重新上传";
     } else if (job.status === "succeeded") {
       title = "已发布版本可下载";
     }
@@ -117,6 +124,10 @@
       setHidden("job-error", true);
     }
     setHidden("job-complete", job.status !== "succeeded");
+    const interruptedBox = el("job-interrupted");
+    if (interruptedBox) {
+      interruptedBox.hidden = job.status !== "interrupted";
+    }
     renderCurrentPackage(job);
   }
 
@@ -140,8 +151,7 @@
           window.setTimeout(tick, 900);
         } else if (settings.onTerminal) {
           settings.onTerminal(job);
-        }
-      } catch (error) {
+        }      } catch (error) {
         failures += 1;
         if (failures <= 4) {
           window.setTimeout(tick, 1500);
@@ -160,6 +170,7 @@
     setUploadDone: setUploadDone,
     showError: showError,
     renderJob: renderJob,
-    pollJob: pollJob
+    pollJob: pollJob,
+    isTerminal: isTerminal
   };
 })();

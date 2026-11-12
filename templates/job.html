@@ -52,6 +52,10 @@
       <a href="{{ url_for('index') }}">刷新发布的样本包列表</a>
     </div>
 
+    <div id="job-interrupted" class="alert alert-error" {% if job.status != 'interrupted' %}hidden{% endif %}>
+      <b>任务已中断。</b>负责该任务的服务进程已退出，可重新上传同一样本；已发布的旧版本包保持可下载。
+    </div>
+
     <div class="process-notes">
       <h3>处理保证</h3>
       <ul>

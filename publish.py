@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -133,11 +134,35 @@ def _write_manifest(release_dir: Path, manifest: dict) -> Path:
     return manifest_path
 
 
-def _atomic_set_current(sample_dir: Path, release_id: str) -> None:
+def _atomic_set_current(
+    sample_dir: Path,
+    release_id: str,
+    expected_current: str | None = None,
+) -> None:
+    """Atomically point ``current`` at ``release_id``.
+
+    ``expected_current`` is a fencing token: the symlink target that the caller
+    observed before building the release.  If another process has meanwhile
+    published a newer package, the replacement is refused instead of silently
+    overwriting it.  ``None`` means the caller expects no current package yet.
+    """
+
     current = sample_dir / "current"
+    observed = _current_target(sample_dir)
+    if expected_current is not None and observed != expected_current:
+        raise PublishError(
+            "发布被拒绝：样本包已被更新的任务发布，本次旧执行不得覆盖新包"
+        )
     tmp_link = sample_dir / f".current-{uuid.uuid4().hex}.tmp"
     os.symlink(os.path.join("releases", release_id), tmp_link, target_is_directory=True)
     try:
+        # Re-check with the replacement staged so the window between the check
+        # and the atomic rename is covered as well.
+        observed = _current_target(sample_dir)
+        if expected_current is not None and observed != expected_current:
+            raise PublishError(
+                "发布被拒绝：样本包已被更新的任务发布，本次旧执行不得覆盖新包"
+            )
         os.replace(tmp_link, current)
         _fsync_dir(sample_dir)
     finally:
@@ -206,11 +231,17 @@ def create_release(
     r1_sha256: str,
     r2_sha256: str,
     keep_releases: int,
+    expected_current: str | None = None,
 ) -> PackageSnapshot:
     """Move verified outputs into a release and atomically publish it.
 
     ``work_dir`` must contain ``R1.fastq.gz`` and ``R2.fastq.gz`` which have
     already passed decompression/structure verification.
+
+    ``expected_current`` is the symlink target (e.g. ``releases/<id>``) the
+    caller observed before starting; the publish is fenced on it so a stale
+    execution can never overwrite a package a newer task published later.
+    Pass ``None`` when no package existed for the sample.
     """
 
     source_r1 = work_dir / R1_NAME
@@ -278,7 +309,7 @@ def create_release(
         # fully intact package.  Do not delete the release from a finally block
         # once this phase starts: a swap may already have succeeded.
         completed = True
-        _atomic_set_current(sample_dir, release_id)
+        _atomic_set_current(sample_dir, release_id, expected_current)
         prune_releases(sample_dir, keep_releases)
         return read_snapshot(sample_dir, sample_id)
     finally:
@@ -330,15 +361,34 @@ def snapshot_for_sample(packages_root: Path, sample_id: str) -> PackageSnapshot 
     return read_snapshot(packages_root / sample_id, sample_id)
 
 
-def cleanup_incomplete(packages_root: Path) -> None:
-    """Remove half-built releases and stale symlink temporaries on startup."""
+def cleanup_incomplete(
+    packages_root: Path,
+    skip_samples: set[str] | None = None,
+    tmp_min_age_seconds: float = 0.0,
+) -> None:
+    """Remove half-built releases and stale symlink temporaries.
 
+    Samples listed in ``skip_samples`` still have a live owner process: their
+    directories are left entirely alone.  Symlink temporaries younger than
+    ``tmp_min_age_seconds`` are kept so a concurrent publisher is never disturbed
+    mid-swap.
+    """
+
+    skip_samples = skip_samples or set()
+    now = time.time()
     if not packages_root.is_dir():
         return
     for sample_dir in packages_root.iterdir():
         if not sample_dir.is_dir():
             continue
+        if sample_dir.name in skip_samples:
+            continue
         for tmp in sample_dir.glob(".current-*.tmp"):
+            try:
+                if now - tmp.stat().st_mtime < tmp_min_age_seconds:
+                    continue
+            except OSError:
+                pass
             try:
                 tmp.unlink()
             except OSError:

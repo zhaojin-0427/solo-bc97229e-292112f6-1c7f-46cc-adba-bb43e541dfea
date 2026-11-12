@@ -66,11 +66,12 @@ class WebIntegrationTest(unittest.TestCase):
 
     def _wait(self, job_id: str, timeout: float = 20.0) -> dict:
         deadline = time.time() + timeout
+        terminal = ("succeeded", "failed", "interrupted")
         while time.time() < deadline:
             response = self.client.get(f"/api/jobs/{job_id}")
             self.assertEqual(response.status_code, 200)
             job = response.get_json()
-            if job["status"] in ("succeeded", "failed"):
+            if job["status"] in terminal:
                 return job
             time.sleep(0.05)
         self.fail(f"job {job_id} did not finish in time")
@@ -151,6 +152,178 @@ class WebIntegrationTest(unittest.TestCase):
             content_type="multipart/form-data",
         )
         self.assertEqual(empty.status_code, 400)
+
+    def _start_job_and_pause(self, sample_id: str, example: str) -> str:
+        """Submit a job and keep the ingest worker busy until tests end."""
+
+        import threading
+
+        import ingest as ingest_module
+
+        original = ingest_module.run_ingest
+        resume = threading.Event()
+        reached = threading.Event()
+
+        def slow_ingest(*args, **kwargs):
+            reached.set()
+            resume.wait(5.0)
+            return original(*args, **kwargs)
+
+        ingest_module.run_ingest = slow_ingest
+
+        def restore():
+            resume.set()
+            ingest_module.run_ingest = original
+
+        self.addCleanup(restore)
+
+        response = self._upload(sample_id, example)
+        self.assertEqual(response.status_code, 202, response.get_data(as_text=True))
+        job_id = response.get_json()["id"]
+        self.assertTrue(reached.wait(5.0))
+        return job_id, resume
+
+    def test_second_process_does_not_reclaim_live_owner_jobs(self) -> None:
+        job_id, resume = self._start_job_and_pause(
+            "DEMO-LIVE", "valid-disordered"
+        )
+        deadline = time.time() + 5.0
+        status = None
+        while time.time() < deadline:
+            status = self.client.get(f"/api/jobs/{job_id}").get_json()
+            if status["status"] == "running":
+                break
+            time.sleep(0.02)
+        self.assertEqual(status["status"], "running")
+        staging = self.data_dir / "staging" / job_id
+        self.assertTrue(staging.is_dir())
+
+        # A second service process starts against the same data directory while
+        # the first process keeps heartbeating.
+        second = self.app_module.create_app(
+            {
+                "TESTING": True,
+                "DATA_DIR": self.data_dir,
+                "JOB_WORKERS": 1,
+                "MAX_UPLOAD_BYTES": 64 * 1024 * 1024,
+                "PROCESS_STALE_SECONDS": 30,
+            }
+        )
+        try:
+            db = self.app_module.connect_main_db(
+                self.data_dir / "ingest.sqlite3"
+            )
+            try:
+                row = db.execute(
+                    "SELECT status, owner_id FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+            finally:
+                db.close()
+            self.assertEqual(row["status"], "running")
+            self.assertIsNotNone(row["owner_id"])
+            self.assertTrue(staging.is_dir())
+
+            # The same sample still rejects duplicate uploads (409), while an
+            # unrelated sample is accepted for normal validation (it fails on
+            # missing files with 400, never a per-sample lock error).
+            duplicate = self.client.post(
+                "/samples",
+                data={"sample_id": "DEMO-LIVE"},
+                headers={"Accept": "application/json"},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(duplicate.status_code, 409)
+            other = second.test_client().post(
+                "/samples",
+                data={"sample_id": "DEMO-OTHER"},
+                headers={"Accept": "application/json"},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(other.status_code, 400)
+
+            # Let the original job finish; it must end in success even though a
+            # second process was started against the same data directory.
+            resume.set()
+            job = self._wait(job_id)
+            self.assertEqual(job["status"], "succeeded", job)
+        finally:
+            second.extensions["process_supervisor"].shutdown()
+
+    def test_interrupted_jobs_allow_reupload_and_keep_old_package(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        import ownership
+
+        first = self._upload("DEMO-RETRY", "valid-disordered")
+        first_job = self._wait(first.get_json()["id"])
+        self.assertEqual(first_job["status"], "succeeded")
+        release_id = first_job["current_package"]["release_id"]
+        before = self.client.get("/samples/DEMO-RETRY/download").data
+
+        # Simulate a job whose owner process died without heartbeats.
+        conn = self.app_module.connect_main_db(
+            self.data_dir / "ingest.sqlite3"
+        )
+        try:
+            dead_owner = "d" * 32
+            ownership.register_process(conn, dead_owner)
+            stale = (
+                datetime.now(timezone.utc) - timedelta(seconds=120)
+            ).isoformat(timespec="seconds")
+            conn.execute(
+                "UPDATE processes SET heartbeat_at = ? WHERE process_id = ?",
+                (stale, dead_owner),
+            )
+            conn.execute(
+                """
+                INSERT INTO jobs(id, sample_id, status, stage, progress,
+                                 created_at, owner_id)
+                VALUES (?, 'DEMO-RETRY', 'running', '处理中', 40, ?, ?)
+                """,
+                ("e" * 32, ownership.utc_now_iso(), dead_owner),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # The periodic reaper (or next process start) marks it interrupted.
+        reaper_conn = self.app_module.connect_main_db(
+            self.data_dir / "ingest.sqlite3"
+        )
+        try:
+            reclaimed = ownership.reap_jobs(
+                reaper_conn,
+                packages_root=self.data_dir / "packages",
+                staging_root=self.data_dir / "staging",
+                stale_seconds=30,
+                logger=self.app.logger,
+            )
+        finally:
+            reaper_conn.close()
+        self.assertIn("e" * 32, reclaimed)
+        interrupted = self.client.get("/api/jobs/" + "e" * 32).get_json()
+        self.assertEqual(interrupted["status"], "interrupted")
+        # The previously published package survives the interruption.
+        self.assertEqual(
+            interrupted["current_package"]["release_id"], release_id
+        )
+
+        # Re-upload now succeeds and becomes the current package; the old
+        # release remains on disk for historical downloads.
+        retry = self._upload("DEMO-RETRY", "valid-disordered")
+        retry_job = self._wait(retry.get_json()["id"])
+        self.assertEqual(retry_job["status"], "succeeded")
+        self.assertNotEqual(
+            retry_job["current_package"]["release_id"], release_id
+        )
+        self.assertEqual(
+            self.client.get("/samples/DEMO-RETRY/download").status_code, 200
+        )
+        first_release = (
+            self.data_dir / "packages" / "DEMO-RETRY" / "releases" / release_id
+        )
+        self.assertTrue((first_release / "package.zip").is_file())
+        self.assertTrue(before)
 
 
 if __name__ == "__main__":

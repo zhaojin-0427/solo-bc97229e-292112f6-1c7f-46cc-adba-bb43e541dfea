@@ -13,10 +13,16 @@
 - 输入必须是完整、可解压且 CRC 正确的 gzip 文件；末尾才发现的 CRC/EOF 错误也会导致失败。
 - 任何校验失败都不会发布部分结果，也不会替换已发布旧包。
 - 重新上传同一样本时，旧包在整个处理期间可下载；只有两个新文件全部写完、复读并校验成功后，才通过原子 symlink 切换发布。
+- 多进程短暂共用同一数据目录（如滚动升级）时的任务归属：
+  - 每个服务进程在 `processes` 表登记并周期性刷新心跳；每个任务通过 `jobs.owner_id` 记录负责进程。
+  - 只要负责进程心跳新鲜，其他进程不得把它的排队/处理中任务标记中断、不得删除其暂存文件或半成品 release，同一样本继续拒绝重传，其他样本照常上传和查询。
+  - 负责进程确已退出（心跳超时，或正常退出时主动注销）后，回收器才把其未完成任务标记为 **已中断（interrupted）**，释放样本槽位并允许重传，同时清理该任务的暂存目录和未完成 release。
+  - 若进程在 symlink 切换成功后、写任务终态前退出，回收器会从磁盘上的完整发布包把任务恢复为 **已完成（succeeded）**，保证已完整发布的包与成功状态一一对应。
+  - 所有任务状态写入都带 `owner_id` 围栏：被回收后苏醒的旧执行，其进度/失败/成功写入全部失效，无法改变终态；发布 symlink 切换还带“期望当前版本”围栏，旧执行发现 `current` 已被后来的包替换时会拒绝覆盖。
 - 进程重启后：
   - 已发布包仍在 `data/packages/<sample>/current/` 下，可立即下载；
-  - 未完成任务标记为失败；
-  - 未完成 release 和暂存文件被清理；
+  - 已死进程的未完成任务标记为已中断并允许重传；存活进程的任务完全不动；
+  - 已死进程遗留的未完成 release 和暂存文件被清理；
   - 数据库目录从磁盘上的已发布包重新同步。
 - 处理内存不随总读数线性增长。记录写入磁盘暂存，索引存放在每任务独立 SQLite 数据库中；进程内只保留当前 FASTQ 记录和少量状态。
 
@@ -205,6 +211,10 @@ GET /samples/<sample_id>/manifest          # manifest JSON
 | `MAX_UPLOAD_BYTES` | `17179869184`（16 GiB） | Flask 请求大小上限 |
 | `JOB_WORKERS` | `1` | 后台任务线程数；建议保持 1，避免大任务争抢磁盘 |
 | `KEEP_RELEASES` | `2` | 每样本保留的已完成 release 数量，最小值按 2 处理 |
+| `PROCESS_STALE_SECONDS` | `30` | 进程心跳超过该秒数未刷新即视为已退出，其任务可被回收（最小 5 秒） |
+| `HEARTBEAT_INTERVAL` | `2` | 心跳写入间隔（秒） |
+| `REAP_INTERVAL` | `10` | 后台回收器轮询间隔（秒）；进程启动时也会立即执行一次回收 |
+| `STAGING_ORPHAN_SECONDS` | `3600` | 暂存目录中无任务归属的条目超过该秒数后才清理，避免误删正在上传的文件 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 | `HOST_PORT` | `5000` | Compose 映射到宿主机的端口 |
 
@@ -227,14 +237,21 @@ DATA_DIR=./data python3 app.py
 PYTHONPATH=. python3 -I -m unittest discover -s tests -t . -v
 ```
 
-安装 Flask 后，Web 集成测试也会自动执行；当前开发环境未安装 Flask 时，3 个 Flask 集成测试会显示为 skipped，其余 ingest/publish 测试仍完整运行。
+安装 Flask 后，Web 集成测试也会自动执行；当前开发环境未安装 Flask 时，Flask 集成测试会显示为 skipped，其余 ingest/publish/ownership 测试仍完整运行。归属与回收的核心逻辑（`tests/test_ownership.py`）只依赖标准库，覆盖：
+
+- 存活负责进程的任务不被其他进程误判中断、暂存与半成品 release 不被清理；
+- 同一样本继续拒绝重传、其他样本可正常上传；
+- 负责进程心跳超时或注销后，任务标记为已中断、释放样本槽位并允许重传；
+- symlink 已切换后进程退出的任务从磁盘发布包恢复为成功；
+- 旧执行的归属围栏写入全部失效，发布围栏拒绝覆盖后来发布的新包。
 
 ## 目录说明
 
 ```text
 app.py                  # Flask 路由、任务状态、上传与后台执行器
+ownership.py            # 进程注册/心跳、任务归属围栏、失效进程任务回收
 ingest.py               # 流式 gzip/FASTQ 校验、SQLite 配对、同步输出
-publish.py              # release、manifest、ZIP、原子 symlink 发布
+publish.py              # release、manifest、ZIP、带围栏的原子 symlink 发布
 templates/              # 网页模板
 static/                 # CSS 和前端轮询逻辑
 tests/                  # unittest 测试

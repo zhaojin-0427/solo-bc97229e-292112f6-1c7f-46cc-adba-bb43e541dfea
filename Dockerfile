@@ -8,14 +8,18 @@ ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/data \
     MAX_UPLOAD_BYTES=17179869184 \
     JOB_WORKERS=1 \
-    KEEP_RELEASES=2
+    KEEP_RELEASES=2 \
+    PROCESS_STALE_SECONDS=30 \
+    HEARTBEAT_INTERVAL=2 \
+    REAP_INTERVAL=10 \
+    STAGING_ORPHAN_SECONDS=3600
 
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY app.py ingest.py publish.py /app/
+COPY app.py ingest.py publish.py ownership.py /app/
 COPY templates /app/templates
 COPY static /app/static
 COPY examples /app/examples
